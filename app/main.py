@@ -1,10 +1,11 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import numpy as np
 from PIL import Image
 import io
 import cv2
+import logging
 
 # ─────────────────────────────────────────────────────────────
 # OPTIONAL OCR (does NOT crash if unavailable)
@@ -14,6 +15,10 @@ try:
     OCR_AVAILABLE = True
 except ImportError:
     OCR_AVAILABLE = False
+
+# ─────────────────────────────────────────────────────────────
+# DeepFace is imported lazily inside endpoints
+# ─────────────────────────────────────────────────────────────
 
 # ─────────────────────────────────────────────────────────────
 # App setup
@@ -29,6 +34,33 @@ app.add_middleware(
 )
 
 # ─────────────────────────────────────────────────────────────
+# Logging setup (visible in Render logs)
+# ─────────────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────────────────────
+# Global exception handlers → always return JSON
+# ─────────────────────────────────────────────────────────────
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"success": False, "message": str(exc.detail)},
+    )
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled exception occurred:")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "success": False,
+            "message": "Internal server error - please try again or use a different photo"
+        },
+    )
+
+# ─────────────────────────────────────────────────────────────
 # Health check (REQUIRED for Render)
 # ─────────────────────────────────────────────────────────────
 @app.get("/")
@@ -40,7 +72,6 @@ def health():
 # ─────────────────────────────────────────────────────────────
 MAX_UPLOAD_SIZE = 8 * 1024 * 1024  # 8 MB
 
-
 # ─────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────
@@ -48,37 +79,30 @@ async def read_image(file: UploadFile):
     contents = await file.read()
     if len(contents) > MAX_UPLOAD_SIZE:
         raise HTTPException(413, "Image file too large (max 8MB)")
-
     try:
         img = Image.open(io.BytesIO(contents))
-        img.verify()
-        img = Image.open(io.BytesIO(contents))
+        img.verify()                    # Validate it's really an image
+        img = Image.open(io.BytesIO(contents))  # Reopen after verify
         return img
-    except Exception:
+    except Exception as e:
+        logger.error(f"Image read/verify failed: {e}")
         raise HTTPException(400, "Invalid or corrupted image file")
-
 
 def calculate_entropy_cv2(img_array: np.ndarray) -> float:
     if img_array.size == 0:
         return 0.0
-
-    gray = (
-        cv2.cvtColor(img_array, cv2.COLOR_BGR2GRAY)
-        if len(img_array.shape) == 3
-        else img_array
-    )
+    gray = cv2.cvtColor(img_array, cv2.COLOR_BGR2GRAY) if len(img_array.shape) == 3 else img_array
     hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
     hist = hist / (hist.sum() + 1e-10)
     hist = hist[hist > 0]
     return float(-np.sum(hist * np.log2(hist + 1e-10)))
-
 
 # ─────────────────────────────────────────────────────────────
 # ID VALIDATION
 # ─────────────────────────────────────────────────────────────
 @app.post("/validate-id")
 async def validate_id(idImage: UploadFile = File(...)):
-    from deepface import DeepFace  # lazy import (IMPORTANT)
+    from deepface import DeepFace  # lazy import
 
     if idImage.content_type not in {"image/jpeg", "image/jpg", "image/png"}:
         raise HTTPException(400, "Only JPEG and PNG images are allowed")
@@ -86,8 +110,8 @@ async def validate_id(idImage: UploadFile = File(...)):
     try:
         pil_img = await read_image(idImage)
         img_array = np.array(pil_img.convert("RGB"))
-
         w, h = pil_img.size
+
         if min(w, h) < 500:
             return {"valid": False, "message": "Image resolution too low (<500px)"}
 
@@ -95,12 +119,12 @@ async def validate_id(idImage: UploadFile = File(...)):
         if not (1.05 <= aspect <= 2.4):
             return {"valid": False, "message": "Unusual aspect ratio for an ID document"}
 
-        # Face detection
+        # ── Face detection ── using opencv backend (lighter & more stable)
         try:
             faces = DeepFace.extract_faces(
                 img_path=img_array,
-                detector_backend="retinaface",
-                enforce_detection=True,
+                detector_backend="opencv",          # CHANGED HERE
+                enforce_detection=True
             )
             if len(faces) != 1:
                 return {"valid": False, "message": f"Expected exactly 1 face, found {len(faces)}"}
@@ -110,6 +134,7 @@ async def validate_id(idImage: UploadFile = File(...)):
                 return {"valid": False, "message": "No clear face detected"}
             if "multiple faces" in msg:
                 return {"valid": False, "message": "Multiple faces detected"}
+            logger.error(f"Face extraction failed: {e}")
             raise
 
         fa = faces[0]["facial_area"]
@@ -124,22 +149,18 @@ async def validate_id(idImage: UploadFile = File(...)):
         # OCR (OPTIONAL)
         if OCR_AVAILABLE:
             try:
-                ocr_text = pytesseract.image_to_string(
-                    pil_img.convert("L")
-                ).lower().strip()
-
+                ocr_text = pytesseract.image_to_string(pil_img.convert("L")).lower().strip()
                 keywords = {
                     "name", "birth", "date", "id", "number", "philippine",
                     "sss", "umid", "license", "passport", "card", "philid", "address"
                 }
-
                 has_text = len(ocr_text) > 25 or any(k in ocr_text for k in keywords)
                 if not has_text:
                     return {"valid": False, "message": "No readable text detected on ID"}
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"OCR failed (non-fatal): {e}")
 
-        # Emotion check
+        # Emotion check (anti-selfie)
         try:
             analysis = DeepFace.analyze(
                 img_path=img_array,
@@ -152,19 +173,16 @@ async def validate_id(idImage: UploadFile = File(...)):
                 score = analysis[0]["emotion"][dom]
                 if dom in {"happy", "surprise"} and score > 78:
                     return {"valid": False, "message": "Looks like a selfie photo"}
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Emotion analysis failed (non-fatal): {e}")
 
         return {"valid": True, "message": "ID photo looks valid ✓"}
 
     except HTTPException:
         raise
-    except Exception:
-        return JSONResponse(
-            status_code=500,
-            content={"valid": False, "message": "Internal server error"},
-        )
-
+    except Exception as e:
+        logger.exception("Unexpected error in validate_id")
+        raise  # will be caught by global handler
 
 # ─────────────────────────────────────────────────────────────
 # FACE VERIFICATION
@@ -172,9 +190,9 @@ async def validate_id(idImage: UploadFile = File(...)):
 @app.post("/verify/face")
 async def verify_face(
     idImage: UploadFile = File(...),
-    selfie: UploadFile = File(...),
+    selfie: UploadFile = File(...)
 ):
-    from deepface import DeepFace  # lazy import (IMPORTANT)
+    from deepface import DeepFace  # lazy import
 
     if idImage.content_type not in {"image/jpeg", "image/jpg", "image/png"}:
         raise HTTPException(400, "ID image must be JPEG/PNG")
@@ -188,24 +206,28 @@ async def verify_face(
         id_array = np.array(id_pil.convert("RGB"))
         selfie_array = np.array(selfie_pil.convert("RGB"))
 
-        # Selfie distance sanity check
+        # Quick selfie size sanity check
         try:
-            faces = DeepFace.extract_faces(selfie_array, detector_backend="retinaface")
+            faces = DeepFace.extract_faces(
+                selfie_array,
+                detector_backend="opencv"  # CHANGED HERE
+            )
             if len(faces) == 1:
                 fa = faces[0]["facial_area"]
                 ratio = (fa["w"] * fa["h"]) / (selfie_pil.width * selfie_pil.height)
                 if ratio > 0.68:
                     return {"success": False, "message": "Selfie taken too close"}
         except Exception:
-            pass
+            pass  # non-fatal
 
+        # Core face verification
         result = DeepFace.verify(
             img1_path=id_array,
             img2_path=selfie_array,
             model_name="ArcFace",
-            detector_backend="retinaface",
+            detector_backend="opencv",          # CHANGED HERE
             enforce_detection=True,
-            silent=True,
+            silent=True
         )
 
         return {
@@ -221,6 +243,8 @@ async def verify_face(
             return {"success": False, "message": "No clear face detected"}
         if "multiple faces" in msg:
             return {"success": False, "message": "Multiple faces detected"}
+        logger.error(f"Verification ValueError: {e}")
         return {"success": False, "message": "Face verification failed"}
-    except Exception:
-        return {"success": False, "message": "Internal error during verification"}
+    except Exception as e:
+        logger.exception("Unexpected error in verify_face")
+        raise  # caught by global handler
