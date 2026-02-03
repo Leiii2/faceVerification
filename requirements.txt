@@ -4,3 +4,4 @@ deepface
 python-multipart
 opencv-python-headless
 numpy
+tf-keras
