@@ -5,23 +5,31 @@ import numpy as np
 from PIL import Image
 import io
 import cv2
-import pytesseract
 
+# ─────────────────────────────────────────────────────────────
+# OPTIONAL OCR (does NOT crash if unavailable)
+# ─────────────────────────────────────────────────────────────
+try:
+    import pytesseract
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
+
+# ─────────────────────────────────────────────────────────────
+# App setup
+# ─────────────────────────────────────────────────────────────
 app = FastAPI(title="ID + Face Verification API", version="1.1.0")
 
-# ─────────────────────────────────────────────────────────────
-# Middleware
-# ─────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ─────────────────────────────────────────────────────────────
-# Health check (IMPORTANT for Render)
+# Health check (REQUIRED for Render)
 # ─────────────────────────────────────────────────────────────
 @app.get("/")
 def health():
@@ -45,7 +53,7 @@ async def read_image(file: UploadFile):
         img = Image.open(io.BytesIO(contents))
         img.verify()
         img = Image.open(io.BytesIO(contents))
-        return contents, img
+        return img
     except Exception:
         raise HTTPException(400, "Invalid or corrupted image file")
 
@@ -53,6 +61,7 @@ async def read_image(file: UploadFile):
 def calculate_entropy_cv2(img_array: np.ndarray) -> float:
     if img_array.size == 0:
         return 0.0
+
     gray = (
         cv2.cvtColor(img_array, cv2.COLOR_BGR2GRAY)
         if len(img_array.shape) == 3
@@ -69,13 +78,13 @@ def calculate_entropy_cv2(img_array: np.ndarray) -> float:
 # ─────────────────────────────────────────────────────────────
 @app.post("/validate-id")
 async def validate_id(idImage: UploadFile = File(...)):
-    from deepface import DeepFace  # ← lazy import
+    from deepface import DeepFace  # lazy import (IMPORTANT)
 
     if idImage.content_type not in {"image/jpeg", "image/jpg", "image/png"}:
         raise HTTPException(400, "Only JPEG and PNG images are allowed")
 
     try:
-        _, pil_img = await read_image(idImage)
+        pil_img = await read_image(idImage)
         img_array = np.array(pil_img.convert("RGB"))
 
         w, h = pil_img.size
@@ -103,26 +112,32 @@ async def validate_id(idImage: UploadFile = File(...)):
                 return {"valid": False, "message": "Multiple faces detected"}
             raise
 
-        face = faces[0]["facial_area"]
-        face_ratio = (face["w"] * face["h"]) / (w * h)
+        fa = faces[0]["facial_area"]
+        face_ratio = (fa["w"] * fa["h"]) / (w * h)
         if face_ratio > 0.40:
-            return {"valid": False, "message": "Face too large — please show the FULL ID card"}
+            return {"valid": False, "message": "Face too large — show the FULL ID"}
 
         entropy = calculate_entropy_cv2(img_array)
         if entropy < 4.6:
             return {"valid": False, "message": "Image too flat / low quality"}
 
-        # OCR text
-        try:
-            text = pytesseract.image_to_string(pil_img.convert("L")).lower()
-            keywords = {
-                "name", "birth", "date", "id", "number", "philippine",
-                "sss", "umid", "license", "passport", "card", "philid", "address"
-            }
-            if len(text.strip()) < 25 and not any(k in text for k in keywords):
-                return {"valid": False, "message": "No readable text detected on ID"}
-        except:
-            pass
+        # OCR (OPTIONAL)
+        if OCR_AVAILABLE:
+            try:
+                ocr_text = pytesseract.image_to_string(
+                    pil_img.convert("L")
+                ).lower().strip()
+
+                keywords = {
+                    "name", "birth", "date", "id", "number", "philippine",
+                    "sss", "umid", "license", "passport", "card", "philid", "address"
+                }
+
+                has_text = len(ocr_text) > 25 or any(k in ocr_text for k in keywords)
+                if not has_text:
+                    return {"valid": False, "message": "No readable text detected on ID"}
+            except Exception:
+                pass
 
         # Emotion check
         try:
@@ -137,7 +152,7 @@ async def validate_id(idImage: UploadFile = File(...)):
                 score = analysis[0]["emotion"][dom]
                 if dom in {"happy", "surprise"} and score > 78:
                     return {"valid": False, "message": "Looks like a selfie photo"}
-        except:
+        except Exception:
             pass
 
         return {"valid": True, "message": "ID photo looks valid ✓"}
@@ -159,7 +174,7 @@ async def verify_face(
     idImage: UploadFile = File(...),
     selfie: UploadFile = File(...),
 ):
-    from deepface import DeepFace  # ← lazy import
+    from deepface import DeepFace  # lazy import (IMPORTANT)
 
     if idImage.content_type not in {"image/jpeg", "image/jpg", "image/png"}:
         raise HTTPException(400, "ID image must be JPEG/PNG")
@@ -167,13 +182,13 @@ async def verify_face(
         raise HTTPException(400, "Selfie must be JPEG/PNG")
 
     try:
-        _, id_pil = await read_image(idImage)
-        _, selfie_pil = await read_image(selfie)
+        id_pil = await read_image(idImage)
+        selfie_pil = await read_image(selfie)
 
         id_array = np.array(id_pil.convert("RGB"))
         selfie_array = np.array(selfie_pil.convert("RGB"))
 
-        # Selfie distance check
+        # Selfie distance sanity check
         try:
             faces = DeepFace.extract_faces(selfie_array, detector_backend="retinaface")
             if len(faces) == 1:
@@ -181,7 +196,7 @@ async def verify_face(
                 ratio = (fa["w"] * fa["h"]) / (selfie_pil.width * selfie_pil.height)
                 if ratio > 0.68:
                     return {"success": False, "message": "Selfie taken too close"}
-        except:
+        except Exception:
             pass
 
         result = DeepFace.verify(
