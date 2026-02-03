@@ -2,3 +2,5 @@ fastapi
 uvicorn
 deepface
 python-multipart
+opencv-python-headless
+numpy
